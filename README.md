@@ -9,7 +9,6 @@ Two tabs, one exe:
 - **Resizer** - batch-downscales textures inside `.ytd` files.
 - **Squisher** - merges several EUP packs into one, sorting out
   drawable/texture id clashes and combining `fxmanifest.lua` along the way.
-  \--
 
 ## Preview
 
