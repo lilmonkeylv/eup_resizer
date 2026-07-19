@@ -31,11 +31,6 @@ other profiles for when you're just iterating:
 - `cargo build` - plain debug, builds in seconds. Fine for poking at the
   UI, but don't judge real resize speed by it - unoptimized Lanczos
   resizing and BCn encoding can be 10-50x slower than release.
-- `cargo build --profile quick` - same optimization level as release
-  (`opt-level = 3`) but without LTO and with more codegen units, so it
-  compiles way faster and still runs close to full speed. The heavy
-  lifting happens inside ISPC/texpresso anyway, which barely cares about
-  LTO. Lands at `target/quick/eup_resizer.exe`.
 
 ## Resizer
 
