@@ -21,7 +21,7 @@ Two tabs, one exe:
 cargo build --release
 ```
 
-`That gives you`target/release/eup_resizer.exe`. You'll need stable Rust
+That gives you `target/release/eup_resizer.exe`. You'll need stable Rust
 and MSVC Build Tools installed (needed for `intel_tex_2`'s ISPC bindings).
 
 Full release builds are slow to compile because of LTO, so there are two
