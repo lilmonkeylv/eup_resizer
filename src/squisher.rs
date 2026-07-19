@@ -187,6 +187,43 @@ pub struct MergeReport {
     pub resize_stats: Option<(usize, usize)>,
 }
 
+pub fn preview_overflow_warnings(packs: &[PathBuf]) -> Vec<String> {
+    let mut totals: HashMap<(PathBuf, String), usize> = HashMap::new();
+    for pack in packs {
+        let mut per_pack: HashMap<(PathBuf, String), HashSet<u32>> = HashMap::new();
+        for rel in walk_relative(pack) {
+            if let Some(key) = parse_asset(&rel) {
+                per_pack
+                    .entry((key.relative_dir, key.prefix))
+                    .or_default()
+                    .insert(key.id);
+            }
+        }
+        for (namespace, ids) in per_pack {
+            *totals.entry(namespace).or_default() += ids.len();
+        }
+    }
+
+    let mut warnings: Vec<String> = totals
+        .into_iter()
+        .filter(|(_, count)| *count > 128)
+        .map(|((relative_dir, prefix), count)| {
+            let dir = relative_dir.display();
+            if count > 255 {
+                format!(
+                    "{dir}/{prefix}: merging would produce {count} distinct ids - the game hard-refuses more than 255 drawables of one component type, expect a crash or missing items in-game"
+                )
+            } else {
+                format!(
+                    "{dir}/{prefix}: merging would produce {count} distinct ids - over the 128 recommended per component type/gender, may cause instability"
+                )
+            }
+        })
+        .collect();
+    warnings.sort();
+    warnings
+}
+
 fn is_manifest(rel: &Path) -> bool {
     let name = rel
         .file_name()
@@ -257,6 +294,8 @@ pub fn merge_packs(
         fs::copy(src, &dest)?;
         Ok((None, None))
     };
+
+    let mut manifest_renames: Vec<Vec<(String, String)>> = vec![Vec::new(); packs.len()];
 
     for (idx, pack) in packs.iter().enumerate() {
         let pack_num = idx + 1;
@@ -356,6 +395,11 @@ pub fn merge_packs(
                             rel.display(),
                             dest_rel.display()
                         ));
+                        if let (Some(old_name), Some(new_name)) =
+                            (rel.file_name().and_then(|n| n.to_str()), dest_rel.file_name().and_then(|n| n.to_str()))
+                        {
+                            manifest_renames[idx].push((old_name.to_string(), new_name.to_string()));
+                        }
                     }
                     report.other_files_copied += 1;
                     planned.push((src, dest_rel, rel.clone()));
@@ -396,7 +440,22 @@ pub fn merge_packs(
         }
     }
 
-    merge_manifests(packs, output, &mut report)?;
+    for ((relative_dir, prefix), namespace) in &used_ids {
+        let count = namespace.len();
+        if count > 255 {
+            report.warnings.push(format!(
+                "{}/{prefix}: {count} distinct ids after merging - the game hard-refuses more than 255 drawables of one component type (this is what tools like Durty Cloth Tool cap at); expect a crash or missing items in-game",
+                relative_dir.display()
+            ));
+        } else if count > 128 {
+            report.warnings.push(format!(
+                "{}/{prefix}: {count} distinct ids after merging - over the 128-per-type guidance line most cloth tools use; not guaranteed to crash, but worth checking in-game before shipping",
+                relative_dir.display()
+            ));
+        }
+    }
+
+    merge_manifests(packs, output, &manifest_renames, &mut report)?;
 
     if any_resized {
         report.resize_stats = Some(resized_total);
@@ -479,7 +538,12 @@ fn parse_manifest(text: &str) -> ParsedManifest {
     parsed
 }
 
-fn merge_manifests(packs: &[PathBuf], output: &Path, report: &mut MergeReport) -> Result<()> {
+fn merge_manifests(
+    packs: &[PathBuf],
+    output: &Path,
+    manifest_renames: &[Vec<(String, String)>],
+    report: &mut MergeReport,
+) -> Result<()> {
     let mut fx_version = None;
     let mut game = None;
     let mut files_entries: Vec<String> = Vec::new();
@@ -490,9 +554,20 @@ fn merge_manifests(packs: &[PathBuf], output: &Path, report: &mut MergeReport) -
     let mut any_extra = false;
 
     for (idx, pack) in packs.iter().enumerate() {
-        let Some(text) = read_manifest(pack) else {
+        let Some(mut text) = read_manifest(pack) else {
             continue;
         };
+        for (old_name, new_name) in &manifest_renames[idx] {
+            let quoted_old = format!("'{old_name}'");
+            let quoted_new = format!("'{new_name}'");
+            if text.contains(&quoted_old) {
+                text = text.replace(&quoted_old, &quoted_new);
+                report.warnings.push(format!(
+                    "pack {} fxmanifest.lua: rewrote reference '{old_name}' -> '{new_name}' to match the renamed file on disk",
+                    idx + 1
+                ));
+            }
+        }
         any_manifest = true;
         let parsed = parse_manifest(&text);
 
@@ -741,7 +816,7 @@ mod tests {
         .unwrap();
 
         let mut report = MergeReport::default();
-        merge_manifests(&[pack_a, pack_b], &out, &mut report).unwrap();
+        merge_manifests(&[pack_a, pack_b], &out, &[Vec::new(), Vec::new()], &mut report).unwrap();
         let merged = fs::read_to_string(out.join("fxmanifest.lua")).unwrap();
 
         let files_start = merged
@@ -787,6 +862,54 @@ mod tests {
         assert!(merged.contains("data_file 'SHOP_PED_APPAREL_META_FILE' 'male_shop.meta'"));
         assert!(
             merged.contains("data_file 'ALTERNATE_VARIATIONS_FILE' 'pedalternatevariations.meta'")
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn collision_renamed_meta_file_gets_its_manifest_reference_rewritten() {
+        let root = std::env::temp_dir().join(format!("eup_squisher_renamed_meta_test_{}", std::process::id()));
+        let pack_a = root.join("a");
+        let pack_b = root.join("b");
+        let out = root.join("out");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&pack_a).unwrap();
+        fs::create_dir_all(&pack_b).unwrap();
+
+        fs::write(pack_a.join("pedalternatevariations.meta"), b"pack-a-alt-variations").unwrap();
+        fs::write(
+            pack_a.join("fxmanifest.lua"),
+            "fx_version 'cerulean'\ngame 'gta5'\ndata_file 'ALTERNATE_VARIATIONS_FILE' 'pedalternatevariations.meta'\n",
+        )
+        .unwrap();
+
+        fs::write(pack_b.join("pedalternatevariations.meta"), b"pack-b-alt-variations-DIFFERENT").unwrap();
+        fs::write(
+            pack_b.join("fxmanifest.lua"),
+            "fx_version 'cerulean'\ngame 'gta5'\ndata_file 'ALTERNATE_VARIATIONS_FILE' 'pedalternatevariations.meta'\n",
+        )
+        .unwrap();
+
+        let mut lines = Vec::new();
+        let report = merge_packs(&[pack_a, pack_b], &out, None, |l| lines.push(l), |_, _| {}).unwrap();
+
+        let merged = fs::read_to_string(out.join("fxmanifest.lua")).unwrap();
+        assert!(
+            merged.contains("data_file 'ALTERNATE_VARIATIONS_FILE' 'pedalternatevariations.meta'"),
+            "pack 1's original reference must survive: {merged}"
+        );
+        assert!(
+            merged.contains("pedalternatevariations_pack2.meta"),
+            "pack 2's renamed file must be referenced under its new name, not left orphaned: {merged}"
+        );
+        assert!(
+            !merged.contains("data_file 'ALTERNATE_VARIATIONS_FILE' 'pedalternatevariations.meta'\ndata_file 'ALTERNATE_VARIATIONS_FILE' 'pedalternatevariations.meta'"),
+            "must not have two identical data_file lines both pointing at pack 1's file"
+        );
+        assert!(
+            report.warnings.iter().any(|w| w.contains("rewrote reference")),
+            "rewriting a stale manifest reference must be logged"
         );
 
         let _ = fs::remove_dir_all(&root);

@@ -35,6 +35,7 @@ struct SquisherState {
     report: Option<MergeReport>,
     rx: Option<crossbeam_channel::Receiver<SquishMsg>>,
     progress: (usize, usize),
+    pending_overflow: Vec<String>,
 }
 
 impl SquisherState {
@@ -49,6 +50,7 @@ impl SquisherState {
             report: None,
             rx: None,
             progress: (0, 0),
+            pending_overflow: Vec::new(),
         }
     }
 
@@ -262,6 +264,19 @@ impl App {
     }
 
     fn start_squish(&mut self) {
+        if self.squisher.output.is_none() || self.squisher.packs.len() < 2 {
+            return;
+        }
+        let warnings = squisher::preview_overflow_warnings(&self.squisher.packs);
+        if !warnings.is_empty() {
+            self.squisher.pending_overflow = warnings;
+            return;
+        }
+        self.start_squish_now();
+    }
+
+    fn start_squish_now(&mut self) {
+        self.squisher.pending_overflow.clear();
         let Some(output) = self.squisher.output.clone() else {
             return;
         };
@@ -459,9 +474,23 @@ impl App {
                 }
 
                 ui.separator();
+                if !self.squisher.pending_overflow.is_empty() {
+                    for w in &self.squisher.pending_overflow {
+                        ui.colored_label(egui::Color32::from_rgb(240, 90, 60), w);
+                    }
+                    ui.horizontal(|ui| {
+                        if ui.button("Squish anyway").clicked() {
+                            self.start_squish_now();
+                        }
+                        if ui.button("Cancel").clicked() {
+                            self.squisher.pending_overflow.clear();
+                        }
+                    });
+                }
                 let can_start = !self.squisher.running
                     && self.squisher.packs.len() >= 2
-                    && self.squisher.output.is_some();
+                    && self.squisher.output.is_some()
+                    && self.squisher.pending_overflow.is_empty();
                 ui.horizontal(|ui| {
                     if ui
                         .add_enabled(can_start, egui::Button::new("Squish"))
