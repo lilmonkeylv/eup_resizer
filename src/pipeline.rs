@@ -4,10 +4,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::Instant;
 
-use anyhow::{Result, anyhow};
-use image::RgbaImage;
+use anyhow::{anyhow, Result};
 use image::imageops::FilterType;
-use intel_tex_2::{RSurface, RgSurface, RgbaSurface, bc1, bc3, bc4, bc5, bc7};
+use image::RgbaImage;
+use intel_tex_2::{bc1, bc3, bc4, bc5, bc7, RSurface, RgSurface, RgbaSurface};
 use rayon::prelude::*;
 
 use crate::progress::{FileResult, ProgressMsg};
@@ -121,15 +121,25 @@ fn is_resizable_format(fmt: TextureFormat) -> bool {
     )
 }
 
-fn round_to_multiple_of_4(v: u32) -> u32 {
-    (v.max(4) + 3) & !3
+fn floor_pow2_min4(v: u32) -> u32 {
+    let v = v.max(4);
+    1u32 << (31 - v.leading_zeros())
+}
+
+fn ceil_pow2_min4(v: u32) -> u32 {
+    let f = floor_pow2_min4(v);
+    if f >= v {
+        f
+    } else {
+        f << 1
+    }
 }
 
 fn compute_target_dims(settings: &Settings, width: u16, height: u16) -> (u16, u16) {
     let (w, h) = (width as u32, height as u32);
-    let floor = settings.min_size_floor.max(4);
+    let user_floor = ceil_pow2_min4(settings.min_size_floor.max(4));
 
-    let (target_w, target_h) = match settings.resize_mode {
+    let (raw_w, raw_h) = match settings.resize_mode {
         ResizeMode::CapResolution => {
             let cap = settings.cap_resolution;
             let longest = w.max(h);
@@ -144,16 +154,32 @@ fn compute_target_dims(settings: &Settings, width: u16, height: u16) -> (u16, u1
             }
         }
         ResizeMode::ScalePercent => {
-            let scale = settings.scale_percent as f64 / 100.0;
-            (
-                ((w as f64) * scale).round() as u32,
-                ((h as f64) * scale).round() as u32,
-            )
+            if settings.scale_percent >= 100 {
+                (w, h)
+            } else {
+                let scale = settings.scale_percent as f64 / 100.0;
+                (
+                    ((w as f64) * scale).round() as u32,
+                    ((h as f64) * scale).round() as u32,
+                )
+            }
         }
     };
 
-    let target_w = round_to_multiple_of_4(target_w.max(floor)).min(round_to_multiple_of_4(w));
-    let target_h = round_to_multiple_of_4(target_h.max(floor)).min(round_to_multiple_of_4(h));
+    let target_w = if raw_w == w {
+        w
+    } else {
+        floor_pow2_min4(raw_w)
+            .max(user_floor)
+            .min(floor_pow2_min4(w))
+    };
+    let target_h = if raw_h == h {
+        h
+    } else {
+        floor_pow2_min4(raw_h)
+            .max(user_floor)
+            .min(floor_pow2_min4(h))
+    };
     (target_w as u16, target_h as u16)
 }
 
@@ -469,11 +495,19 @@ fn process_texture(tex: &RawTexture, settings: &Settings, skip_list: &[String]) 
         Err(e) => return TextureOutcome::skip(format!("'{}': {e}, left unchanged", tex.name)),
     };
 
-    let resized = if needs_resize {
+    let (chain_w, chain_h) = if needs_resize {
+        (target_w, target_h)
+    } else {
+        (
+            floor_pow2_min4(tex.width as u32) as u16,
+            floor_pow2_min4(tex.height as u32) as u16,
+        )
+    };
+    let resized = if (chain_w, chain_h) != (tex.width, tex.height) {
         image::imageops::resize(
             &decoded,
-            target_w as u32,
-            target_h as u32,
+            chain_w as u32,
+            chain_h as u32,
             FilterType::Lanczos3,
         )
     } else {
@@ -504,11 +538,20 @@ fn process_texture(tex: &RawTexture, settings: &Settings, skip_list: &[String]) 
             tex.name, tex.levels, levels
         ));
     }
+    if chain_w != tex.width || chain_h != tex.height {
+        let note = format!(
+            "'{}': {}x{} isn't a power of two, snapped to {chain_w}x{chain_h} to keep the mip chain valid",
+            tex.name, tex.width, tex.height
+        );
+        if !needs_resize {
+            warning = Some(warning.map_or(note.clone(), |w| format!("{w}; {note}")));
+        }
+    }
 
     TextureOutcome {
         patch: Some(TexturePatch {
-            width: target_w,
-            height: target_h,
+            width: chain_w,
+            height: chain_h,
             format: target_format,
             levels,
             pixel_data,
@@ -712,4 +755,102 @@ pub fn run_batch(
     let _ = tx.send(ProgressMsg::BatchFinished {
         elapsed_secs: start.elapsed().as_secs_f64(),
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn floor_pow2_min4_should_floor_to_nearest_power_of_two() {
+        assert_eq!(floor_pow2_min4(1023), 512);
+        assert_eq!(floor_pow2_min4(1024), 1024);
+        assert_eq!(floor_pow2_min4(3), 4);
+    }
+
+    #[test]
+    fn ceil_pow2_min4_should_ceil_to_nearest_power_of_two() {
+        assert_eq!(ceil_pow2_min4(65), 128);
+        assert_eq!(ceil_pow2_min4(64), 64);
+        assert_eq!(ceil_pow2_min4(1), 4);
+    }
+
+    #[test]
+    fn compute_target_dims_cap_resolution_should_always_return_power_of_two_when_resizing() {
+        let mut settings = Settings {
+            min_size_floor: 4,
+            ..Settings::default()
+        };
+        for (cap, w, h) in [
+            (1024u32, 3000u16, 2000u16),
+            (512, 900, 900),
+            (1024, 4096, 2731),
+        ] {
+            settings.cap_resolution = cap;
+            let (tw, th) = compute_target_dims(&settings, w, h);
+            assert!(
+                tw.is_power_of_two(),
+                "width {tw} not a power of two for input {w}x{h} cap {cap}"
+            );
+            assert!(
+                th.is_power_of_two(),
+                "height {th} not a power of two for input {w}x{h} cap {cap}"
+            );
+        }
+    }
+
+    #[test]
+    fn compute_target_dims_scale_percent_should_always_return_power_of_two_when_resizing() {
+        let mut settings = Settings {
+            resize_mode: ResizeMode::ScalePercent,
+            min_size_floor: 4,
+            ..Settings::default()
+        };
+        for (pct, w, h) in [
+            (75u32, 2048u16, 2048u16),
+            (33, 1024, 1024),
+            (90, 4096, 4096),
+        ] {
+            settings.scale_percent = pct;
+            let (tw, th) = compute_target_dims(&settings, w, h);
+            assert!(
+                tw.is_power_of_two(),
+                "width {tw} not a power of two for {pct}% of {w}x{h}"
+            );
+            assert!(
+                th.is_power_of_two(),
+                "height {th} not a power of two for {pct}% of {w}x{h}"
+            );
+        }
+    }
+
+    #[test]
+    fn compute_target_dims_should_leave_untouched_dims_alone_regardless_of_power_of_two() {
+        let cap_settings = Settings {
+            cap_resolution: 1024,
+            min_size_floor: 4,
+            ..Settings::default()
+        };
+        assert_eq!(compute_target_dims(&cap_settings, 900, 770), (900, 770));
+
+        let scale_settings = Settings {
+            resize_mode: ResizeMode::ScalePercent,
+            scale_percent: 100,
+            min_size_floor: 4,
+            ..Settings::default()
+        };
+        assert_eq!(compute_target_dims(&scale_settings, 900, 770), (900, 770));
+    }
+
+    #[test]
+    fn compute_target_dims_should_respect_user_min_size_floor_as_power_of_two() {
+        let settings = Settings {
+            cap_resolution: 4,
+            min_size_floor: 64,
+            ..Settings::default()
+        };
+        let (w, h) = compute_target_dims(&settings, 2048, 2048);
+        assert!(w.is_power_of_two() && w >= 64);
+        assert!(h.is_power_of_two() && h >= 64);
+    }
 }
